@@ -22,7 +22,8 @@ pgvector>=0.2.5            # Wajib: Ekstensi Vector DB untuk PostgreSQL
 langgraph>=0.0.60
 langchain-core>=0.2.10
 langchain-openai>=0.1.17       # Eksekutor Qwen via OpenAI API Format
-langchain-google-genai>=1.0.6  # SDK Resmi Gemini terintegrasi LangChain
+langchain-google-genai>=1.0.6 
+langchain-groq==0.2.1 # SDK Resmi Gemini terintegrasi LangChain
 openai>=1.35.0                 # SDK Universal (dipakai untuk Qwen)
 google-generativeai>=0.7.0     # Native SDK Gemini untuk Vision/Image
 tiktoken>=0.7.0                # OpenAI Tokenizer (standar RAG)
