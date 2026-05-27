@@ -50,3 +50,5 @@ passlib[bcrypt]>=1.7.4            # Hashing Password
 redis>=5.0.4               # Klien Redis untuk Cache & Pub/Sub
 celery>=5.4.0              # Antrean tugas (Task Queue) untuk OCR berat
 websockets>=12.0           # Komunikasi Real-time (Chat & Log Agent)
+apscheduler>=3.10.4
+mlxtend>=0.23.1
