@@ -90,7 +90,7 @@ async def match_rab_to_catalog(
             matched_products = []
             for product, dist in matches:
                 similarity = (1 - dist) * 100 
-                if similarity >= 50.0:  # Minimal 50% tingkat kemiripan
+                if similarity >= 82.0:  # Minimal 50% tingkat kemiripan
                     matched_products.append({
                         "id": str(product.id),
                         "sku": product.sku,
