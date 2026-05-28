@@ -21,6 +21,10 @@ class B2BNegotiationState(TypedDict):
     maut_allowed_discount: float
     mba_cross_sell_opportunities: List[Dict[str, Any]]
 
+    # Data anti-halusinasi dari Pricing Node untuk mengunci perilaku LLM
+    product_catalog_facts: str
+    negotiation_directives: str
+
     # Data pendukung untuk Vision Node (Ekstraksi RAB)
     uploaded_file_bytes: bytes | None
     uploaded_file_mime_type: str | None
