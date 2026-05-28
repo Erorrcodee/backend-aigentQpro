@@ -2,6 +2,7 @@ import logging
 from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 from app.agents.state import B2BNegotiationState
+from app.agents.llm_clients import sumopod_logical_llm
 from app.agents.llm_clients import groq_logical_llm
 
 logger = logging.getLogger(__name__)
@@ -14,7 +15,7 @@ class IntentCheck(BaseModel):
     reason: str
 
 # Gunakan klien logis dengan struktur baru
-gateway_agent = groq_logical_llm.with_structured_output(IntentCheck)
+gateway_agent = sumopod_logical_llm.with_structured_output(IntentCheck)
 
 async def execute_gateway_node(state: B2BNegotiationState) -> dict:
     logger.info("[NODE] Memasuki Gateway Node (Intent & Routing)...")

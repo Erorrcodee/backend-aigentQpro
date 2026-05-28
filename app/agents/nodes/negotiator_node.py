@@ -3,6 +3,7 @@
 Node Senior Sales Consultant B2B: Merangkai jawaban berdasarkan FAKTA KATALOG,
 menangani edukasi produk, serta menentukan deal negosiasi.
 """
+from app.agents.llm_clients import sumopod_chat_llm
 import logging
 from langchain_core.messages import SystemMessage
 from app.agents.state import B2BNegotiationState
@@ -93,7 +94,7 @@ ATURAN ANTI-HALUSINASI (WAJIB DIPATUHI - PELANGGARAN BERAKIBAT FATAL):
     messages_to_send = [SystemMessage(content=sys_msg)] + state["messages"]
 
     # Eksekusi pemanggilan ke LLM
-    response = await groq_chat_llm.ainvoke(messages_to_send)
+    response = await sumopod_chat_llm.ainvoke(messages_to_send)
 
     logger.info(f"[NEGOTIATOR] Selesai. Deal Reached: {deal_reached}")
 
