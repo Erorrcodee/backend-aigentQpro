@@ -77,7 +77,7 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
                     similarity = (1 - dist) * 100
                     
                     # Batas Kemiripan Ketat (Minimal 82%)
-                    if similarity >= 82.0:
+                    if similarity >= 50.0:
                         # PRODUK DITEMUKAN & VALID
                         hpp_line = product.price * item_qty
                         total_hpp_riil += hpp_line
