@@ -1,12 +1,11 @@
 import logging
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from app.agents.state import B2BNegotiationState
 from app.core.database import AsyncSessionLocal
 from app.models.product_catalog import Product
 from app.services.maut_calculator import MAUTCalculator
 from app.services.recommendation_engine import recommendation_engine
-# Import service pembuat vektor
 from app.services.embedding_service import generate_product_vector
 
 logger = logging.getLogger(__name__)
@@ -17,18 +16,18 @@ maut_engine = MAUTCalculator()
 async def execute_pricing_node(state: B2BNegotiationState) -> dict:
     """
     Node LangGraph untuk:
-    1. Menangkap item dari dokumen RAB dan pesan obrolan (mentioned_products).
-    2. Memvalidasi item menggunakan Semantic Search (Vector) ke PostgreSQL.
+    1. Menangkap item dari dokumen RAB dan pesan obrolan.
+    2. Memvalidasi item menggunakan Hybrid Search (Text ILIKE + Vector) ke PostgreSQL.
     3. Mengeksekusi MBA (Market Basket Analysis) secara proaktif.
     4. Menghitung diskon maksimal via MAUT berdasarkan metrik riil.
     """
-    logger.info("[NODE] Memasuki Pricing Node (Vector Search Mode)...")
+    logger.info("[NODE] Memasuki Pricing Node (Hybrid Search Mode)...")
 
     rab_items = state.get("rab_items", [])
     mentioned_products = state.get("mentioned_products", [])
     existing_metrics = state.get("project_metrics", {})
 
-    # Jika tidak ada RAB dan tidak ada barang yang disebut di chat, lewati pencarian
+    # Lewati node jika tidak ada target pencarian dari RAB maupun obrolan
     if not rab_items and not mentioned_products:
         logger.info("[PRICING] Tidak ada target pencarian. Melewati node.")
         return {"product_catalog_facts": "", "negotiation_directives": ""}
@@ -39,32 +38,44 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
     negotiation_directives: list[str] = []
     cross_sell_opps: list[dict] = []
 
+    # ==========================================
     # 1. KONSOLIDASI TARGET PENCARIAN
-    # Gabungkan item dari RAB dan obrolan agar tidak ada duplikasi query
+    # ==========================================
     search_targets = {}
     
     for item in rab_items:
         name = item.get("name") or item.get("item_name") or ""
         if name:
+            # Gunakan lower() sebagai key kamus agar tidak ada duplikasi
             search_targets[name.lower()] = float(item.get("quantity", item.get("qty", 0)))
             
     for mp in mentioned_products:
         if mp.lower() not in search_targets:
-            search_targets[mp.lower()] = 0.0 # Kuantitas 0 karena hanya ditanyakan di chat
+            # Kuantitas 0 karena pelanggan hanya bertanya stok/harga di obrolan
+            search_targets[mp.lower()] = 0.0 
 
-    # 2. EKSEKUSI PENCARIAN VEKTOR DI DATABASE
+    # ==========================================
+    # 2. EKSEKUSI PENCARIAN HIBRIDA DI DATABASE
+    # ==========================================
     async with AsyncSessionLocal() as db:
         for query_name, item_qty in search_targets.items():
             try:
-                # Ubah teks pencarian menjadi vektor
+                # Ubah teks pencarian menjadi vektor untuk Semantic Search
                 query_vector = await generate_product_vector(query_name)
                 
-                # Hitung jarak kosinus
+                # Jarak 0.30 setara dengan kemiripan 70%
                 distance_col = Product.embedding.cosine_distance(query_vector).label("distance")
                 
+                # PENCARIAN HIBRIDA: Cek nama yang mirip (Teks) ATAU makna yang mirip (Vektor)
                 stmt = (
                     select(Product, distance_col)
                     .where(Product.is_active == True)
+                    .where(
+                        or_(
+                            Product.name.ilike(f"%{query_name}%"),
+                            distance_col <= 0.30  
+                        )
+                    )
                     .order_by(distance_col)
                     .limit(1)
                 )
@@ -74,50 +85,50 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
 
                 if row:
                     product, dist = row
-                    similarity = (1 - dist) * 100
                     
-                    # Batas Kemiripan Ketat (Minimal 82%)
-                    if similarity >= 50.0:
-                        # PRODUK DITEMUKAN & VALID
-                        hpp_line = product.price * item_qty
-                        total_hpp_riil += hpp_line
-                        total_volume_riil += item_qty
+                    # PRODUK VALID (Lolos via ILIKE atau Vektor)
+                    hpp_line = product.price * item_qty
+                    total_hpp_riil += hpp_line
+                    total_volume_riil += item_qty
 
-                        spec_text = ""
-                        if product.specifications:
-                            spec_entries = [f"{k}: {v}" for k, v in product.specifications.items()]
-                            spec_text = "; ".join(spec_entries)
+                    spec_text = ""
+                    if product.specifications:
+                        spec_entries = [f"{k}: {v}" for k, v in product.specifications.items()]
+                        spec_text = "; ".join(spec_entries)
 
-                        validated_facts.append(
-                            f"[TERSEDIA] Kueri '{query_name}' cocok dengan: {product.name} (SKU: {product.sku}) | "
-                            f"Harga: Rp{product.price:,.0f}/{product.unit} | "
-                            f"Stok: {product.stock} {product.unit} | "
-                            f"Spesifikasi: {spec_text or 'Tidak ada data spesifikasi'}"
+                    # Fakta untuk AI Negosiator
+                    validated_facts.append(
+                        f"[TERSEDIA] Kueri '{query_name}' dikaitkan dengan: {product.name} (SKU: {product.sku}) | "
+                        f"Harga: Rp{product.price:,.0f}/{product.unit} | "
+                        f"Stok: {product.stock} {product.unit} | "
+                        f"Spesifikasi: {spec_text or 'Tidak ada data spesifikasi'}"
+                    )
+
+                    # Jika kuantitas > 0, berikan instruksi negosiasi dan kalkulasi MAUT
+                    if item_qty > 0:
+                        tier_label = "TIER-3 (Volume Besar)" if item_qty >= 100 else "TIER-2 (Volume Sedang)" if item_qty >= 50 else "TIER-1 (Volume Kecil)"
+                        negotiation_directives.append(
+                            f"Untuk '{product.name}': Kuantitas {item_qty} masuk {tier_label}. "
+                            f"HPP riil: Rp{product.price:,.0f}. Jangan berikan diskon di bawah HPP."
                         )
-
-                        if item_qty > 0:
-                            tier_label = "TIER-3 (Volume Besar)" if item_qty >= 100 else "TIER-2 (Volume Sedang)" if item_qty >= 50 else "TIER-1 (Volume Kecil)"
-                            negotiation_directives.append(
-                                f"Untuk '{product.name}': Kuantitas {item_qty} masuk {tier_label}. "
-                                f"HPP riil: Rp{product.price:,.0f}. Jangan berikan diskon di bawah HPP."
-                            )
-                    else:
-                        # DITEMUKAN TAPI TIDAK MIRIP (Mencegah Halusinasi)
-                        validated_facts.append(f"[TIDAK TERSEDIA] Barang '{query_name}' tidak ditemukan di katalog.")
-                        negotiation_directives.append(f"WAJIB jujur bahwa '{query_name}' sedang kosong/tidak tersedia.")
                 else:
-                    # SAMA SEKALI TIDAK ADA DI DATABASE
+                    # SAMA SEKALI TIDAK DITEMUKAN
                     validated_facts.append(f"[TIDAK TERSEDIA] Barang '{query_name}' tidak ditemukan di katalog.")
+                    negotiation_directives.append(f"WAJIB jujur bahwa '{query_name}' sedang kosong/tidak tersedia.")
                     
             except Exception as e:
-                logger.error(f"Gagal memproses kueri vektor untuk '{query_name}': {str(e)}")
+                logger.error(f"Gagal memproses kueri hibrida untuk '{query_name}': {str(e)}")
 
+        # ==========================================
         # 3. EKSEKUSI MARKET BASKET ANALYSIS (MBA)
+        # ==========================================
         if rab_items:
             mba_analysis = await recommendation_engine.analyze_rab_basket(rab_items, db)
             cross_sell_opps = mba_analysis.get("cross_sell_opportunities", [])
 
+    # ==========================================
     # 4. KALKULASI DISKON MAUT
+    # ==========================================
     real_project_metrics = {
         "total_hpp_estimated": total_hpp_riil,
         "total_volume": total_volume_riil,
@@ -135,7 +146,7 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
     )
 
     negotiation_directives.append(
-        "ATURAN UTAMA: Baca spesifikasi HANYA dari Fakta Katalog. Dilarang merekayasa spesifikasi atau harga."
+        "ATURAN UTAMA: Baca spesifikasi dan stok HANYA dari Fakta Katalog. Dilarang merekayasa spesifikasi atau harga."
     )
 
     logger.info(
@@ -143,7 +154,9 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
         f"Volume: {total_volume_riil}, Max Diskon: {allowed_discount}%"
     )
 
+    # ==========================================
     # 5. PENGEMBALIAN STATE LANGGRAPH
+    # ==========================================
     return {
         "project_metrics": real_project_metrics,
         "maut_allowed_discount": allowed_discount,
