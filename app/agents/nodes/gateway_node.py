@@ -3,26 +3,26 @@ from langchain_core.messages import AIMessage
 from pydantic import BaseModel, Field
 from app.agents.state import B2BNegotiationState
 from app.agents.llm_clients import sumopod_logical_llm
-from app.agents.llm_clients import groq_logical_llm
 
 logger = logging.getLogger(__name__)
 
-# 1. PERKUAT STRUKTUR OUTPUT (Mendeteksi Niat)
+# 1. PERKUAT STRUKTUR OUTPUT (Mendeteksi Niat & Ekstrak Barang)
 class IntentCheck(BaseModel):
     is_off_topic: bool = Field(description="True jika obrolan sama sekali di luar konteks B2B, konstruksi, atau material.")
     intent_category: str = Field(description="Pilih salah satu: 'tanya_barang', 'negosiasi_diskon', 'deal_setuju', 'salam_umum'")
     extracted_discount: float = Field(description="Jika user secara spesifik menyebut angka/persen diskon, tulis angkanya. Jika tidak, WAJIB isi 0.0")
+    mentioned_products: list[str] = Field(description="WAJIB DIISI! Ekstrak nama barang atau merek yang diketik user. Contoh: ['semen gresik', 'keramik KIA']. Jika tidak ada, isi list kosong [].")
     reason: str
 
-# Gunakan klien logis dengan struktur baru
+# Gunakan klien logis dengan struktur baru (GPT-4o-Mini via SumoPod)
 gateway_agent = sumopod_logical_llm.with_structured_output(IntentCheck)
 
 async def execute_gateway_node(state: B2BNegotiationState) -> dict:
-    logger.info("[NODE] Memasuki Gateway Node (Intent & Routing)...")
+    logger.info("[NODE] Memasuki Gateway Node (Intent, Routing & Extraction)...")
     
     messages = state.get("messages", [])
     if not messages:
-        return {"is_off_topic": False}
+        return {"is_off_topic": False, "mentioned_products": []}
         
     latest_message = messages[-1].content
 
@@ -44,33 +44,39 @@ async def execute_gateway_node(state: B2BNegotiationState) -> dict:
 
     ATURAN KLASIFIKASI:
     1. Tentukan `intent_category`:
-       - 'tanya_barang': Jika user bertanya ketersediaan, stok, jenis semen, besi, atau spesifikasi (contoh: "semen gresik ready?").
-       - 'negosiasi_diskon': Jika user eksplisit meminta potongan harga (contoh: "minta diskon 5%", "kurangin harganya").
-       - 'deal_setuju': Jika user sepakat (contoh: "deal", "oke saya ambil").
-       - 'salam_umum': Jika sekadar sapaan (contoh: "halo", "pagi").
+       - 'tanya_barang': Jika user bertanya ketersediaan, stok, jenis semen, besi, atau spesifikasi.
+       - 'negosiasi_diskon': Jika user eksplisit meminta potongan harga.
+       - 'deal_setuju': Jika user sepakat.
+       - 'salam_umum': Jika sekadar sapaan.
     2. Tentukan `extracted_discount`:
        - Jika user TIDAK menyebut angka diskon, pastikan nilainya 0.0.
-    3. `is_off_topic`:
-       - Hanya bernilai True jika murni membahas di luar konstruksi/material (misal: cuaca, politik, resep makanan).
+    3. Tentukan `mentioned_products`:
+       - WAJIB ekstrak nama barang/merek ke dalam list ini. Jika user menyebut "semen gresik", masukkan ["semen gresik"]. Ini sangat penting untuk pencarian database!
+    4. `is_off_topic`:
+       - Hanya bernilai True jika murni membahas di luar konstruksi/material.
     """
 
     try:
         result = await gateway_agent.ainvoke(prompt_instruction)
-        logger.info(f"[GATEWAY] Kategori: {result.intent_category} | Diskon Terdeteksi: {result.extracted_discount}%")
+        logger.info(f"[GATEWAY] Kategori: {result.intent_category} | Diskon: {result.extracted_discount}% | Barang: {result.mentioned_products}")
         
         # Jika benar-benar ngawur (di luar topik)
         if result.is_off_topic:
             reject_msg = AIMessage(content="Maaf, saya hanya dapat membantu urusan pengadaan material bangunan dan negosiasi RAB B2B. Ada yang bisa saya bantu terkait proyek Anda?")
             return {"is_off_topic": True, "messages": [reject_msg]}
             
-        # PEMBARUAN STATE YANG KRUSIAL:
-        # Kita timpa state `requested_discount` dengan hasil tangkapan LLM.
-        # Ini akan menghapus "ingatan diskon 0.0%" yang menempel (stuck) dari putaran sebelumnya.
+        # PEMBARUAN STATE YANG KRUSIAL
         return {
             "is_off_topic": False,
-            "requested_discount": result.extracted_discount
+            "requested_discount": result.extracted_discount,
+            "mentioned_products": result.mentioned_products
         }
 
     except Exception as e:
         logger.error(f"[GATEWAY] Error klasifikasi: {str(e)}. Default: loloskan pesan.")
-        return {"is_off_topic": False, "requested_discount": 0.0}
+        # Jika gagal, pastikan state tidak rusak dengan memberikan nilai default
+        return {
+            "is_off_topic": False, 
+            "requested_discount": 0.0,
+            "mentioned_products": []
+        }
