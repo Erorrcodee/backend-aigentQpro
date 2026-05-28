@@ -1,68 +1,75 @@
-# app/agents/nodes/gateway_node.py
 import logging
 from langchain_core.messages import AIMessage
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from app.agents.state import B2BNegotiationState
 from app.agents.llm_clients import groq_logical_llm
 
 logger = logging.getLogger(__name__)
 
+# 1. PERKUAT STRUKTUR OUTPUT (Mendeteksi Niat)
 class IntentCheck(BaseModel):
-    is_off_topic: bool
+    is_off_topic: bool = Field(description="True jika obrolan sama sekali di luar konteks B2B, konstruksi, atau material.")
+    intent_category: str = Field(description="Pilih salah satu: 'tanya_barang', 'negosiasi_diskon', 'deal_setuju', 'salam_umum'")
+    extracted_discount: float = Field(description="Jika user secara spesifik menyebut angka/persen diskon, tulis angkanya. Jika tidak, WAJIB isi 0.0")
     reason: str
 
-# Langsung gunakan klien logis dari llm_clients dan pasang pengekstraksi struktur
+# Gunakan klien logis dengan struktur baru
 gateway_agent = groq_logical_llm.with_structured_output(IntentCheck)
 
 async def execute_gateway_node(state: B2BNegotiationState) -> dict:
-    logger.info("[NODE] Memasuki Gateway Node (Groq)...")
+    logger.info("[NODE] Memasuki Gateway Node (Intent & Routing)...")
     
-    messages = state["messages"]
+    messages = state.get("messages", [])
+    if not messages:
+        return {"is_off_topic": False}
+        
     latest_message = messages[-1].content
 
-    # Bangun konteks percakapan: ambil maksimal 4 pesan terakhir (selain pesan terbaru)
-    # agar gateway memahami bahwa ini adalah kelanjutan negosiasi yang sedang berjalan
-    history_messages = messages[:-1][-4:]  # Maksimal 4 pesan sebelumnya
+    # Bangun konteks percakapan singkat
+    history_messages = messages[:-1][-3:]
     conversation_context = ""
     if history_messages:
         lines = []
         for msg in history_messages:
             role = "AI" if msg.__class__.__name__ == "AIMessage" else "User"
-            # Potong pesan panjang agar tidak membebani token
-            content_preview = str(msg.content)[:200]
-            lines.append(f"  [{role}]: {content_preview}")
-        conversation_context = "Riwayat percakapan sebelumnya:\n" + "\n".join(lines) + "\n\n"
+            lines.append(f"[{role}]: {str(msg.content)[:100]}")
+        conversation_context = "Riwayat singkat:\n" + "\n".join(lines) + "\n\n"
 
     prompt_instruction = f"""
-    Kamu adalah penjaga topik percakapan sistem B2B pengadaan material bangunan QHome.
+    Kamu adalah Manajer Analisis Niat (Intent) untuk sistem B2B QHome.
+    Tugasmu adalah menganalisis pesan terbaru dari pengguna dan mengekstrak parameternya.
 
-    {conversation_context}Pesan terbaru dari user: "{latest_message}"
+    {conversation_context}Pesan terbaru user: "{latest_message}"
 
-    ATURAN PENILAIAN (baca dengan seksama):
-
-    1. SELALU kembalikan is_off_topic=FALSE untuk:
-       - Pesan yang membahas: material/bahan bangunan, proyek konstruksi, RAB, harga, diskon, negosiasi, pengadaan, kontrak, invoice, pengiriman, pembayaran.
-       - Pesan perkenalan diri atau perusahaan dalam konteks bisnis (contoh: "Halo, saya Budi dari PT XYZ").
-       - Pesan pendek yang merupakan KELANJUTAN NEGOSIASI seperti: "saya setuju", "ok", "deal", "oke", "lanjut", "baik", "ya", "tidak", "setuju saja", "oke saya terima", "boleh", atau ungkapan serupa APAPUN.
-       - Jika ada riwayat percakapan negosiasi sebelumnya, SEMUA pesan lanjutan dianggap relevan.
-       - Jika ragu, SELALU pilih is_off_topic=FALSE.
-
-    2. HANYA kembalikan is_off_topic=TRUE jika pesan JELAS-JELAS membahas topik yang sama sekali tidak berkaitan seperti: hiburan, politik, gosip selebriti, resep masakan, olahraga, dll — DAN tidak ada riwayat percakapan negosiasi sebelumnya.
-
-    PRINSIP UTAMA: Lebih baik meloloskan pesan yang sedikit ambigu daripada memblokir pesan yang valid.
+    ATURAN KLASIFIKASI:
+    1. Tentukan `intent_category`:
+       - 'tanya_barang': Jika user bertanya ketersediaan, stok, jenis semen, besi, atau spesifikasi (contoh: "semen gresik ready?").
+       - 'negosiasi_diskon': Jika user eksplisit meminta potongan harga (contoh: "minta diskon 5%", "kurangin harganya").
+       - 'deal_setuju': Jika user sepakat (contoh: "deal", "oke saya ambil").
+       - 'salam_umum': Jika sekadar sapaan (contoh: "halo", "pagi").
+    2. Tentukan `extracted_discount`:
+       - Jika user TIDAK menyebut angka diskon, pastikan nilainya 0.0.
+    3. `is_off_topic`:
+       - Hanya bernilai True jika murni membahas di luar konstruksi/material (misal: cuaca, politik, resep makanan).
     """
 
     try:
         result = await gateway_agent.ainvoke(prompt_instruction)
-        logger.info(f"[GATEWAY] Hasil klasifikasi: is_off_topic={result.is_off_topic}, alasan: {result.reason}")
+        logger.info(f"[GATEWAY] Kategori: {result.intent_category} | Diskon Terdeteksi: {result.extracted_discount}%")
         
+        # Jika benar-benar ngawur (di luar topik)
         if result.is_off_topic:
-            reject_msg = AIMessage(content="Maaf, saya hanya dapat membantu urusan pengadaan material bangunan dan negosiasi RAB. Silakan hubungi kami untuk kebutuhan proyek konstruksi Anda.")
+            reject_msg = AIMessage(content="Maaf, saya hanya dapat membantu urusan pengadaan material bangunan dan negosiasi RAB B2B. Ada yang bisa saya bantu terkait proyek Anda?")
             return {"is_off_topic": True, "messages": [reject_msg]}
             
-        return {"is_off_topic": False}
+        # PEMBARUAN STATE YANG KRUSIAL:
+        # Kita timpa state `requested_discount` dengan hasil tangkapan LLM.
+        # Ini akan menghapus "ingatan diskon 0.0%" yang menempel (stuck) dari putaran sebelumnya.
+        return {
+            "is_off_topic": False,
+            "requested_discount": result.extracted_discount
+        }
 
     except Exception as e:
         logger.error(f"[GATEWAY] Error klasifikasi: {str(e)}. Default: loloskan pesan.")
-        # Jika LLM gagal, amankan dengan meloloskan pesan (fail-open)
-        return {"is_off_topic": False}
+        return {"is_off_topic": False, "requested_discount": 0.0}
