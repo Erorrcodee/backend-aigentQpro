@@ -1,4 +1,5 @@
 import logging
+import traceback
 from sqlalchemy import select, or_, func
 
 from app.agents.state import B2BNegotiationState
@@ -8,29 +9,47 @@ from app.services.maut_calculator import MAUTCalculator
 from app.services.recommendation_engine import recommendation_engine
 from app.services.embedding_service import generate_product_vector
 
+# Setup Logger khusus untuk modul Pricing
 logger = logging.getLogger(__name__)
 
 # Instansiasi MAUT
 maut_engine = MAUTCalculator()
 
 async def execute_pricing_node(state: B2BNegotiationState) -> dict:
-    """
-    Node LangGraph untuk:
-    1. Menangkap item dari dokumen RAB dan pesan obrolan.
-    2. Memvalidasi item menggunakan Ultimate Hybrid Search (Trigram Typo-Tolerance + Vector).
-    3. Mengeksekusi MBA (Market Basket Analysis) secara proaktif.
-    4. Menghitung diskon maksimal via MAUT berdasarkan metrik riil.
-    """
-    logger.info("[NODE] Memasuki Pricing Node (Ultimate Hybrid Search Mode)...")
+    logger.info("==========================================================================")
+    logger.info("🏢 [PRICING - START] Memulai Eksekusi Node Validasi Katalog & Harga")
+    logger.info("==========================================================================")
 
     rab_items = state.get("rab_items", [])
     mentioned_products = state.get("mentioned_products", [])
     existing_metrics = state.get("project_metrics", {})
+    messages = state.get("messages", [])
 
-    # Lewati node jika tidak ada target pencarian dari RAB maupun obrolan
+    logger.info(f"📥 [PRICING - INPUT] Item RAB: {len(rab_items)} item | Produk dari Chat: {mentioned_products}")
+
+    # Lapis Pertahanan Darurat: Jika Gateway kosong, tapi ada riwayat obrolan
+    if not mentioned_products and not rab_items and messages:
+        last_msg = messages[-1].content
+        word_count = len(last_msg.split())
+        if 1 < word_count <= 10:
+            logger.warning("🛟 [PRICING - FALLBACK] Gateway kosong! Mengekstrak pesan terakhir sebagai kueri cadangan.")
+            mentioned_products = [last_msg]
+            logger.info(f"   ↳ Kueri diselamatkan: {mentioned_products}")
+
+    # Lewati node jika benar-benar tidak ada target
     if not rab_items and not mentioned_products:
-        logger.info("[PRICING] Tidak ada target pencarian. Melewati node.")
-        return {"product_catalog_facts": "", "negotiation_directives": ""}
+        logger.info("⏩ [PRICING - SKIP] Tidak ada target spesifik. Memberikan konteks katalog umum ke AI.")
+        
+        general_facts = (
+            "[INFO UMUM QHOME] QHome adalah penyedia material B2B. "
+            "Katalog kami mencakup: Semen, Besi Baja, Keramik, Granit, Pasir, Bata, dan Cat."
+        )
+        general_directives = "Sambut user dengan ramah. Beritahu mereka katalog kita secara singkat."
+        
+        return {
+            "product_catalog_facts": general_facts, 
+            "negotiation_directives": general_directives
+        }
 
     total_hpp_riil = 0.0
     total_volume_riil = 0.0
@@ -52,30 +71,32 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
         if mp.lower() not in search_targets:
             search_targets[mp.lower()] = 0.0 
 
+    logger.info(f"📋 [PRICING - TARGET] Daftar akhir yang akan dicari di database: {search_targets}")
+
     # ==========================================
     # 2. EKSEKUSI PENCARIAN HIBRIDA TINGKAT LANJUT
     # ==========================================
     async with AsyncSessionLocal() as db:
         for query_name, item_qty in search_targets.items():
+            logger.info(f"🔍 [PRICING - SEARCH] Memproses kueri: '{query_name}' (Qty: {item_qty})")
             try:
-                # Kalkulasi Vektor untuk Pencarian Makna (Semantic)
+                # Kalkulasi Vektor untuk Pencarian Makna
+                logger.info("   ↳ Generate vektor semantik (Google Gemini)...")
                 query_vector = await generate_product_vector(query_name)
                 vector_distance = Product.embedding.cosine_distance(query_vector).label("vector_distance")
                 
-                # Kalkulasi Trigram untuk Toleransi Salah Ketik (Typo)
+                # Kalkulasi Trigram untuk Toleransi Salah Ketik
                 text_similarity = func.similarity(Product.name, query_name).label("text_similarity")
                 
-                # PENCARIAN HIBRIDA: Lolos jika teks mirip secara ketikan ATAU makna vektor mendekati
                 stmt = (
                     select(Product, vector_distance, text_similarity)
                     .where(Product.is_active == True)
                     .where(
                         or_(
-                            text_similarity > 0.25,  # Toleransi salah ketik moderat
-                            vector_distance <= 0.45  # Toleransi makna semantik (55% similarity)
+                            text_similarity > 0.25,  
+                            vector_distance <= 0.45  
                         )
                     )
-                    # Prioritaskan teks yang paling mirip secara ketikan, baru kemudian kemiripan makna
                     .order_by(text_similarity.desc(), vector_distance.asc())
                     .limit(1)
                 )
@@ -85,8 +106,9 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
 
                 if row:
                     product, v_dist, t_sim = row
+                    logger.info(f"✅ [PRICING - MATCH] Berhasil! '{query_name}' ➔ '{product.name}' (SKU: {product.sku})")
+                    logger.info(f"   📊 Skor Evaluasi - Trigram: {t_sim:.2f} | Jarak Vektor: {v_dist:.2f}")
                     
-                    # PRODUK VALID
                     hpp_line = product.price * item_qty
                     total_hpp_riil += hpp_line
                     total_volume_riil += item_qty
@@ -96,7 +118,6 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
                         spec_entries = [f"{k}: {v}" for k, v in product.specifications.items()]
                         spec_text = "; ".join(spec_entries)
 
-                    # Fakta untuk AI Negosiator
                     validated_facts.append(
                         f"[TERSEDIA] Kueri '{query_name}' dikaitkan dengan: {product.name} (SKU: {product.sku}) | "
                         f"Harga: Rp{product.price:,.0f}/{product.unit} | "
@@ -111,19 +132,25 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
                             f"HPP riil: Rp{product.price:,.0f}. Jangan berikan diskon di bawah HPP."
                         )
                 else:
-                    # SAMA SEKALI TIDAK DITEMUKAN
+                    logger.warning(f"❌ [PRICING - MISS] Kueri '{query_name}' ditolak oleh database!")
+                    logger.warning("   ↳ Alasan: Tidak memenuhi ambang batas Trigram (>0.25) maupun Vektor (<=0.45).")
+                    
                     validated_facts.append(f"[TIDAK TERSEDIA] Barang '{query_name}' tidak ditemukan di katalog.")
                     negotiation_directives.append(f"WAJIB jujur bahwa '{query_name}' sedang kosong/tidak tersedia.")
                     
             except Exception as e:
-                logger.error(f"Gagal memproses kueri hibrida untuk '{query_name}': {str(e)}")
+                logger.error(f"💥 [PRICING - FATAL_ERROR] Kueri SQL atau Vektor gagal untuk '{query_name}'!")
+                logger.error(f"   Detail Pesan: {str(e)}")
+                logger.error(f"   Stack Trace:\n{traceback.format_exc()}")
 
         # ==========================================
         # 3. EKSEKUSI MARKET BASKET ANALYSIS (MBA)
         # ==========================================
         if rab_items:
+            logger.info("🛒 [PRICING - MBA] Menjalankan algoritma Market Basket Analysis...")
             mba_analysis = await recommendation_engine.analyze_rab_basket(rab_items, db)
             cross_sell_opps = mba_analysis.get("cross_sell_opportunities", [])
+            logger.info(f"   ↳ Ditemukan {len(cross_sell_opps)} peluang cross-selling.")
 
     # ==========================================
     # 4. KALKULASI DISKON MAUT
@@ -148,10 +175,13 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
         "ATURAN UTAMA: Baca spesifikasi dan stok HANYA dari Fakta Katalog. Dilarang merekayasa spesifikasi atau harga."
     )
 
-    logger.info(
-        f"[NODE] Pricing Selesai. HPP Riil: Rp{total_hpp_riil:,.0f}, "
-        f"Volume: {total_volume_riil}, Max Diskon: {allowed_discount}%"
-    )
+    logger.info("==========================================================================")
+    logger.info("📈 [PRICING - SUMMARY] Hasil Akhir Kalkulasi Node:")
+    logger.info(f"   💰 Total HPP Riil : Rp{total_hpp_riil:,.0f}")
+    logger.info(f"   📦 Total Volume   : {total_volume_riil}")
+    logger.info(f"   🎯 Diskon Maks MAUT: {allowed_discount}%")
+    logger.info("💾 [PRICING - END_STATE] Mengirimkan hasil ke Negotiator Node.")
+    logger.info("==========================================================================")
 
     # ==========================================
     # 5. PENGEMBALIAN STATE LANGGRAPH

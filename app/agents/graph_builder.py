@@ -27,48 +27,47 @@ graph_builder.add_node("invoice_node", execute_invoice_node)
 # 3. Fungsi Logika Persimpangan (Conditional Routing)
 def route_from_gateway(state: B2BNegotiationState):
     """Menentukan arah aliran setelah melalui penjagaan Gateway."""
+    logger.info("🚦 [ROUTER - GATEWAY] Mengevaluasi persimpangan rute...")
+    
     if state.get("is_off_topic", False):
-        logger.warning("[ROUTER] Topik melenceng terdeteksi! Memutus aliran ke END.")
+        logger.warning("   ⛔ Topik melenceng! Rute diputus dan obrolan dihentikan (END).")
         return END 
     
-    # PERCABANGAN CERDAS: Cek apakah ada file dokumen yang diunggah
+    # PERCABANGAN CERDAS
     if state.get("uploaded_file_bytes") is not None:
-        logger.info("[ROUTER] Dokumen terdeteksi. Mengarahkan ke Vision Node.")
+        logger.info("   📄 Ada file RAB yang menunggu dibaca. Mengarahkan rute ke ➔ Vision Node.")
         return "vision_node"
         
-    logger.info("[ROUTER] Tidak ada dokumen. Potong kompas ke Pricing Node.")
+    logger.info("   💬 Tidak ada file RAB. Potong kompas, mengarahkan rute ke ➔ Pricing Node.")
     return "pricing_node"
 
 # 4. Rajut Alurnya
-# Mulai -> Gateway
+logger.info("🕸️ [GRAPH BUILDER] Merajut alur StateGraph B2B QHome...")
 graph_builder.add_edge(START, "gateway_node")
 
-# Gateway -> (Persimpangan: Lanjut ke Vision, potong ke Pricing, atau Berhenti?)
 graph_builder.add_conditional_edges(
     "gateway_node",
     route_from_gateway,
     {
         "vision_node": "vision_node",
-        "pricing_node": "pricing_node", # Rute jalan pintas
-        END: END # Kunci rapat kebocoran graf
+        "pricing_node": "pricing_node", 
+        END: END 
     }
 )
 
-# Jika lewat Vision, setelahnya pasti masuk ke Pricing
 graph_builder.add_edge("vision_node", "pricing_node")
-
-# Dari Pricing selalu ke Negotiator
 graph_builder.add_edge("pricing_node", "negotiator_node")
 
 # 5. Fungsi Router dari Negotiator
-# Jika negotiator menyetujui deal (is_deal_reached=True), alur diteruskan ke Invoice Node.
-# Jika belum deal (negosiasi masih berlanjut), alur berakhir dan menunggu pesan berikutnya.
 def route_from_negotiator(state: B2BNegotiationState):
     """Menentukan apakah transaksi perlu dikunci atau negosiasi masih berlanjut."""
+    logger.info("🚦 [ROUTER - NEGOTIATOR] Mengevaluasi hasil negosiasi akhir...")
+    
     if state.get("is_deal_reached", False):
-        logger.info("[ROUTER] Deal tercapai! Mengarahkan ke Invoice Node untuk penguncian transaksi.")
+        logger.info("   🎉 DEAL TERCAPAI! Meneruskan alur ke ➔ Invoice Node untuk penguncian data.")
         return "invoice_node"
-    logger.info("[ROUTER] Negosiasi masih berlanjut. Mengakhiri putaran ini.")
+        
+    logger.info("   ⏳ Negosiasi berlanjut (Belum Deal). Menghentikan siklus graph sementara (END).")
     return END
 
 graph_builder.add_conditional_edges(
@@ -80,9 +79,9 @@ graph_builder.add_conditional_edges(
     }
 )
 
-# Invoice Node adalah terminal — setelah invoice terbit, sesi selesai
 graph_builder.add_edge("invoice_node", END)
 
-# 5. Kompilasi Graf
+# 6. Kompilasi Graf
 memory = MemorySaver()
 app_graph = graph_builder.compile(checkpointer=memory)
+logger.info("✅ [GRAPH BUILDER] Arsitektur LangGraph berhasil dikompilasi dengan MemorySaver.")

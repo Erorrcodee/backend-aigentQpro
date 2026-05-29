@@ -3,28 +3,39 @@
 Node Senior Sales Consultant B2B: Merangkai jawaban berdasarkan FAKTA KATALOG,
 menangani edukasi produk, serta menentukan deal negosiasi.
 """
-from app.agents.llm_clients import sumopod_chat_llm
 import logging
-from langchain_core.messages import SystemMessage
+import traceback
+from langchain_core.messages import SystemMessage, AIMessage
 from app.agents.state import B2BNegotiationState
+
+from app.agents.llm_clients import sumopod_chat_llm
 from app.agents.llm_clients import groq_chat_llm
 
+# Setup Logger khusus untuk modul Negotiator
 logger = logging.getLogger(__name__)
 
 async def execute_negotiator_node(state: B2BNegotiationState) -> dict:
     """
     Node pamungkas untuk merangkai jawaban negosiasi ke pengguna tanpa halusinasi.
     """
-    logger.info("[NODE] Memasuki Negotiator Node...")
+    logger.info("==========================================================================")
+    logger.info("🗣️ [NEGOTIATOR - START] Memulai Eksekusi Node Generasi Balasan AI")
+    logger.info("==========================================================================")
 
     # 1. Tarik parameter diskon
     requested_discount = state.get("requested_discount", 0.0)
     max_allowed = state.get("maut_allowed_discount", 0.0)
     
+    logger.info(f"📥 [NEGOTIATOR - PARAMETER] Diskon Diminta: {requested_discount}% | Batas Maks (MAUT): {max_allowed}%")
+
     # 2. Tarik FAKTA MUTLAK dari Pricing Node (Anti-Halusinasi)
     catalog_facts = state.get("product_catalog_facts", "Belum ada data barang yang divalidasi.")
     directives = state.get("negotiation_directives", "")
     cross_sells = state.get("mba_cross_sell_opportunities", [])
+
+    logger.info(f"📚 [NEGOTIATOR - FAKTA] Menerima data katalog dari Pricing Node (Panjang karakter: {len(catalog_facts)})")
+    if cross_sells:
+        logger.info(f"🛒 [NEGOTIATOR - MBA] Menyisipkan instruksi penawaran silang (Cross-sell) untuk {len(cross_sells)} item.")
 
     # --- Logika Deal Deterministik ---
     # Hanya anggap deal tercapai jika user BENAR-BENAR meminta diskon (> 0.0)
@@ -48,7 +59,9 @@ async def execute_negotiator_node(state: B2BNegotiationState) -> dict:
             mba_text += f"- Karena ada '{trigger}', rekomendasikan '{sku}' (Rp {harga}) sebagai pelengkap.\n"
 
     # --- Susun Konteks Percakapan (Fase Konsultasi vs Fase Tawar-Menawar) ---
+    logger.info("⚙️ [NEGOTIATOR - FASE] Menentukan arah percakapan...")
     if not is_negotiating:
+        logger.info("   ↳ Mode: 🤝 KONSULTASI & EDUKASI (Belum ada tawar-menawar)")
         deal_context = (
             "FASE SAAT INI: KONSULTASI & EDUKASI.\n"
             "Klien belum meminta diskon spesifik. FOKUSLAH menjawab pertanyaan klien, "
@@ -56,6 +69,7 @@ async def execute_negotiator_node(state: B2BNegotiationState) -> dict:
             "Jangan membahas persetujuan/penolakan diskon secara prematur."
         )
     elif deal_reached:
+        logger.info("   ↳ Mode: 🎉 PENUTUPAN DEAL (Diskon disetujui)")
         deal_context = (
             f"FASE SAAT INI: PENUTUPAN DEAL.\n"
             f"Permintaan diskon klien sebesar {requested_discount}% DISETUJUI. "
@@ -63,6 +77,7 @@ async def execute_negotiator_node(state: B2BNegotiationState) -> dict:
             f"Informasikan bahwa sistem sedang menyiapkan dokumen invoice."
         )
     else:
+        logger.info(f"   ↳ Mode: 🛡️ COUNTER-OFFER (Diskon ditolak, menawarkan maks {max_allowed}%)")
         deal_context = (
             f"FASE SAAT INI: TAWAR-MENAWAR (COUNTER-OFFER).\n"
             f"Permintaan diskon {requested_discount}% DITOLAK karena melebihi otorisasi batas maksimal {max_allowed}%. "
@@ -93,10 +108,26 @@ ATURAN ANTI-HALUSINASI (WAJIB DIPATUHI - PELANGGARAN BERAKIBAT FATAL):
     # Sisipkan instruksi sistem di urutan paling awal, diikuti riwayat obrolan user
     messages_to_send = [SystemMessage(content=sys_msg)] + state["messages"]
 
-    # Eksekusi pemanggilan ke LLM
-    response = await sumopod_chat_llm.ainvoke(messages_to_send)
+    # Eksekusi pemanggilan ke LLM dengan pelindungan Try-Except
+    try:
+        logger.info("🧠 [NEGOTIATOR - LLM_CALL] Memanggil AI untuk menghasilkan respons teks (Streaming)...")
+        response = await sumopod_chat_llm.ainvoke(messages_to_send)
+        logger.info("✅ [NEGOTIATOR - LLM_SUCCESS] Berhasil menghasilkan respons teks.")
 
-    logger.info(f"[NEGOTIATOR] Selesai. Deal Reached: {deal_reached}")
+    except Exception as e:
+        logger.error("💥 [NEGOTIATOR - FATAL_ERROR] Gagal memanggil API LLM (SumoPod/OpenAI)!")
+        logger.error(f"   Detail Pesan: {str(e)}")
+        logger.error(f"   Stack Trace:\n{traceback.format_exc()}")
+        
+        # Fallback darurat agar WebSocket tidak putus paksa karena tidak ada balasan
+        logger.warning("🛟 [NEGOTIATOR - FALLBACK] Mengirimkan pesan darurat ke klien.")
+        fallback_text = "Mohon maaf, sistem komunikasi kami sedang mengalami gangguan teknis sementara waktu. Silakan coba kirim ulang pesan Anda dalam beberapa saat."
+        response = AIMessage(content=fallback_text)
+        deal_reached = False
+        final_discount = 0.0
+
+    logger.info(f"💾 [NEGOTIATOR - END_STATE] Status Kesepakatan: {deal_reached} | Diskon Disetujui: {final_discount}%")
+    logger.info("==========================================================================")
 
     return {
         "messages": [response],
