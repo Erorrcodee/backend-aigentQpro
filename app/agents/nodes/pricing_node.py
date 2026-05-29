@@ -73,7 +73,7 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
                     .where(
                         or_(
                             Product.name.ilike(f"%{query_name}%"),
-                            distance_col <= 0.30  
+                            distance_col <= 0.10  
                         )
                     )
                     .order_by(distance_col)
