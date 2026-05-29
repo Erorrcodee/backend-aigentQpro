@@ -1,5 +1,5 @@
 import logging
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, func
 
 from app.agents.state import B2BNegotiationState
 from app.core.database import AsyncSessionLocal
@@ -17,11 +17,11 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
     """
     Node LangGraph untuk:
     1. Menangkap item dari dokumen RAB dan pesan obrolan.
-    2. Memvalidasi item menggunakan Hybrid Search (Text ILIKE + Vector) ke PostgreSQL.
+    2. Memvalidasi item menggunakan Ultimate Hybrid Search (Trigram Typo-Tolerance + Vector).
     3. Mengeksekusi MBA (Market Basket Analysis) secara proaktif.
     4. Menghitung diskon maksimal via MAUT berdasarkan metrik riil.
     """
-    logger.info("[NODE] Memasuki Pricing Node (Hybrid Search Mode)...")
+    logger.info("[NODE] Memasuki Pricing Node (Ultimate Hybrid Search Mode)...")
 
     rab_items = state.get("rab_items", [])
     mentioned_products = state.get("mentioned_products", [])
@@ -46,37 +46,37 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
     for item in rab_items:
         name = item.get("name") or item.get("item_name") or ""
         if name:
-            # Gunakan lower() sebagai key kamus agar tidak ada duplikasi
             search_targets[name.lower()] = float(item.get("quantity", item.get("qty", 0)))
             
     for mp in mentioned_products:
         if mp.lower() not in search_targets:
-            # Kuantitas 0 karena pelanggan hanya bertanya stok/harga di obrolan
             search_targets[mp.lower()] = 0.0 
 
     # ==========================================
-    # 2. EKSEKUSI PENCARIAN HIBRIDA DI DATABASE
+    # 2. EKSEKUSI PENCARIAN HIBRIDA TINGKAT LANJUT
     # ==========================================
     async with AsyncSessionLocal() as db:
         for query_name, item_qty in search_targets.items():
             try:
-                # Ubah teks pencarian menjadi vektor untuk Semantic Search
+                # Kalkulasi Vektor untuk Pencarian Makna (Semantic)
                 query_vector = await generate_product_vector(query_name)
+                vector_distance = Product.embedding.cosine_distance(query_vector).label("vector_distance")
                 
-                # Jarak 0.30 setara dengan kemiripan 70%
-                distance_col = Product.embedding.cosine_distance(query_vector).label("distance")
+                # Kalkulasi Trigram untuk Toleransi Salah Ketik (Typo)
+                text_similarity = func.similarity(Product.name, query_name).label("text_similarity")
                 
-                # PENCARIAN HIBRIDA: Cek nama yang mirip (Teks) ATAU makna yang mirip (Vektor)
+                # PENCARIAN HIBRIDA: Lolos jika teks mirip secara ketikan ATAU makna vektor mendekati
                 stmt = (
-                    select(Product, distance_col)
+                    select(Product, vector_distance, text_similarity)
                     .where(Product.is_active == True)
                     .where(
                         or_(
-                            Product.name.ilike(f"%{query_name}%"),
-                            distance_col <= 0.10  
+                            text_similarity > 0.25,  # Toleransi salah ketik moderat
+                            vector_distance <= 0.45  # Toleransi makna semantik (55% similarity)
                         )
                     )
-                    .order_by(distance_col)
+                    # Prioritaskan teks yang paling mirip secara ketikan, baru kemudian kemiripan makna
+                    .order_by(text_similarity.desc(), vector_distance.asc())
                     .limit(1)
                 )
                 
@@ -84,9 +84,9 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
                 row = result.first()
 
                 if row:
-                    product, dist = row
+                    product, v_dist, t_sim = row
                     
-                    # PRODUK VALID (Lolos via ILIKE atau Vektor)
+                    # PRODUK VALID
                     hpp_line = product.price * item_qty
                     total_hpp_riil += hpp_line
                     total_volume_riil += item_qty
@@ -104,7 +104,6 @@ async def execute_pricing_node(state: B2BNegotiationState) -> dict:
                         f"Spesifikasi: {spec_text or 'Tidak ada data spesifikasi'}"
                     )
 
-                    # Jika kuantitas > 0, berikan instruksi negosiasi dan kalkulasi MAUT
                     if item_qty > 0:
                         tier_label = "TIER-3 (Volume Besar)" if item_qty >= 100 else "TIER-2 (Volume Sedang)" if item_qty >= 50 else "TIER-1 (Volume Kecil)"
                         negotiation_directives.append(
