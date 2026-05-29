@@ -66,7 +66,7 @@ async def execute_gateway_node(state: B2BNegotiationState) -> dict:
     3. Tentukan `mentioned_products`:
        - Ekstrak seluruh nama produk, material, atau merek yang disebutkan dalam pesan terbaru.
        - Contoh jika user menginput "ada semen gresik 40kg", isi dengan ["semen gresik 40kg"].
-       - Jika tidak ada produk yang disebutkan, isi dengan list kosong [].
+       - Jika user HANYA menyatakan sepakat (misal: "oke", "deal", "setuju", "oke deal", "siap"), WAJIB isi dengan list kosong []. Jangan pernah memasukkan kata "deal", "oke", atau "setuju" sebagai nama produk!
     
     4. Tentukan `is_off_topic`:
        - Bernilai True HANYA jika pesan murni membahas hal di luar konstruksi, bangunan, atau material.
