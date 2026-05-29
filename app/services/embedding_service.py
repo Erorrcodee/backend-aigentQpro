@@ -6,16 +6,16 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Inisialisasi model LLM pengubah Teks -> Vektor Angka milik Google
-# text-embedding-004 adalah model gratis terbaru dari Google (Output: 768 Dimensi)
+# Migrasi ke model embedding generasi terbaru dari Google yang aktif saat ini
 embedding_model = GoogleGenerativeAIEmbeddings(
-    model="models/text-embedding-004", # <--- INI TERSANGKANYA, SUDAH DIPERBAIKI
+    model="models/gemini-embedding-2", # <--- UPDATE KE MODEL GENERASI KEDUA
     google_api_key=settings.GEMINI_API_KEY
 )
 
 async def generate_product_vector(text_content: str) -> list[float]:
     """
-    Fungsi untuk mengubah deskripsi produk menjadi 768 dimensi Vektor Angka.
+    Fungsi untuk mengubah deskripsi produk menjadi Vektor Angka.
+    Menggunakan pemotongan [:768] untuk memastikan kompatibilitas batas dimensi dengan kolom pgvector di database Anda.
     """
     try:
         # LangChain Google GenAI aembed_query
