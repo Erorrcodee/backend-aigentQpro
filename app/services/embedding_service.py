@@ -9,8 +9,7 @@ logger = logging.getLogger(__name__)
 # Inisialisasi model LLM pengubah Teks -> Vektor Angka milik Google
 # text-embedding-004 adalah model gratis terbaru dari Google (Output: 768 Dimensi)
 embedding_model = GoogleGenerativeAIEmbeddings(
-    model="models/gemini-embedding-004",
-    
+    model="models/text-embedding-004", # <--- INI TERSANGKANYA, SUDAH DIPERBAIKI
     google_api_key=settings.GEMINI_API_KEY
 )
 
